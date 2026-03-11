@@ -552,6 +552,7 @@ def no_context_no_code_pretrain(args):
         mlp_hidden_times=4,
         vqvae_ckpt=args.vqvae_ckpt
     )
+    model = torch.compile(model)
 
     if args.data_type == "ecg":
         full_set = NoContextNormalECGDataset(
