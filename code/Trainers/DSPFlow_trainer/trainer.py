@@ -3,6 +3,7 @@ import wandb
 import os
 from tqdm import tqdm
 from torch.utils.data import DataLoader
+import copy
 
 
 class DSPFlowTrainer(object):
@@ -18,6 +19,10 @@ class DSPFlowTrainer(object):
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.model = model.to(device)
+        self.ema_model = copy.deepcopy(self.model).to(device)
+        self.ema_model.requires_grad_(False)
+
+
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.max_epochs = max_epochs
@@ -271,14 +276,14 @@ class DSPFlowTrainer(object):
             train_total_avg = total_loss / tr_seen
 
             """evaluation"""
-            self.model.eval()
+            self.ema_model.eval()
+            self.ema_model.load_state_dict(ema_state_dict)
             with torch.no_grad():
                 val_total, val_seen = 0, 0
-                # for batch in self.val_loader:
                 for batch in tqdm(self.val_loader, desc=f"Eval Epoch {epoch}"):
                     batch["signals"] = batch["signals"].to(dtype=model_dtype, device=self.device)
                     batch["attn_mask"] = batch["attn_mask"].to(dtype=torch.bool, device=self.device)
-                    loss = self.model(batch, mode="no_context_no_code")
+                    loss = self.ema_model(batch, mode="no_context_no_code")
                     val_total += loss.item() * batch["signals"].shape[0]
                     val_seen += batch["signals"].shape[0]
 
@@ -292,22 +297,27 @@ class DSPFlowTrainer(object):
                     "step": global_steps,
                     "lr": self.optimizer.param_groups[0]["lr"],
                 })
-                if self.early_stop == "true":
-                    if val_total < best_val_loss:
-                        best_val_loss = val_total
-                        no_improve_epochs = 0
-                        torch.save(self.model.state_dict(), f"{self.save_dir}/ckpt.pth")
-                        torch.save(ema_state_dict, f"{self.save_dir}/ema_ckpt.pth")
-                    else:
-                        no_improve_epochs += 1
-
-                    if no_improve_epochs >= self.patience:
-                        print(f"⛔ Early stopping triggered at Step {global_steps}.")
-                        break
-                else:
+                # if self.early_stop == "true":
+                #     if val_total < best_val_loss:
+                #         best_val_loss = val_total
+                #         no_improve_epochs = 0
+                #         torch.save(self.model.state_dict(), f"{self.save_dir}/ckpt.pth")
+                #         torch.save(ema_state_dict, f"{self.save_dir}/ema_ckpt.pth")
+                #     else:
+                #         no_improve_epochs += 1
+                #
+                #     if no_improve_epochs >= self.patience:
+                #         print(f"⛔ Early stopping triggered at Step {global_steps}.")
+                #         break
+                # else:
+                #     torch.save(self.model.state_dict(), f"{self.save_dir}/ckpt.pth")
+                #     torch.save(ema_state_dict, f"{self.save_dir}/ema_ckpt.pth")
+                if val_total < best_val_loss:
+                    best_val_loss = val_total
                     torch.save(self.model.state_dict(), f"{self.save_dir}/ckpt.pth")
                     torch.save(ema_state_dict, f"{self.save_dir}/ema_ckpt.pth")
-            self.scheduler.step(val_total)
+
+            # self.scheduler.step(val_total)
         wandb.finish()
 
 
