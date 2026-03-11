@@ -1,0 +1,363 @@
+import matplotlib.pyplot as plt
+import wfdb
+import os
+import numpy as np
+from scipy.signal import decimate
+import os
+import json
+import numpy as np
+from tqdm import tqdm
+from pathlib import Path
+import random
+
+def extract_normal_windows_from_record(
+    anomaly_label,
+    source_name,
+    window_size,
+    stride,
+):
+    """
+    Extract pure-normal windows:
+    - no anomaly (>0)
+    - no invalid (-1)
+    """
+    windows = []
+
+    N = len(anomaly_label)
+
+    for start in range(0, N - window_size + 1, stride):
+        end = start + window_size
+        seg = anomaly_label[start:end]
+
+        # 跳过无效区域
+        if np.any(seg == -1):
+            continue
+
+        # 只要出现 anomaly，就不是 normal
+        if np.any(seg > 0):
+            continue
+
+        windows.append({
+            "source_file": source_name,
+            "start": int(start),
+            "end": int(end),
+            "anomaly_type": 0
+        })
+
+    return windows
+
+
+def build_normal_ts(
+    npz_file,
+    output_dir,
+    window_size=800,
+    stride=100,
+):
+    os.makedirs(output_dir, exist_ok=True)
+
+    data = np.load(npz_file)
+    anomaly_label = data["anomaly_label"]
+
+    windows = extract_normal_windows_from_record(
+        anomaly_label=anomaly_label,
+        source_name=npz_file,
+        window_size=window_size,
+        stride=stride,
+    )
+
+    out_path = os.path.join(output_dir, f"normal_{window_size}.jsonl")
+
+    with open(out_path, "w") as f:
+        for item in windows:
+            f.write(json.dumps(item) + "\n")
+
+    print(f"[NORMAL] {os.path.basename(npz_file)}  windows={len(windows)}")
+
+    return {
+        "total": len(windows)
+    }
+
+
+
+def get_normal_indices():
+    for filename in os.listdir("./npz_files"):
+        if filename.endswith(".npz"):
+
+            build_normal_ts(
+                npz_file=f"./npz_files/{filename}",
+                output_dir=f"normal_indices_144/{filename.split('.')[0]}",
+                window_size=144,
+                stride=1,
+            )
+
+            build_normal_ts(
+                npz_file=f"./npz_files/{filename}",
+                output_dir=f"normal_indices_384/{filename.split('.')[0]}",
+                window_size=384,
+                stride=1,
+            )
+
+
+def get_anomaly_segments(labels, anomaly_type):
+    """
+    输入: labels = 0/1 的 array
+    输出: list of (start_idx, end_idx)
+    """
+    labels = np.array(labels)
+    idx = np.where(labels == anomaly_type)[0]  # 找出所有标为 1 的点
+    segments = []
+
+    if len(idx) == 0:
+        return segments
+
+    start = idx[0]
+    prev = idx[0]
+
+    for i in idx[1:]:
+        if i == prev + 1:
+            # 继续同一段
+            prev = i
+        else:
+            # 上一段结束
+            segments.append((start, prev))
+            start = i
+            prev = i
+
+    # 记得补上最后一段
+    segments.append((start, prev))
+    return segments
+
+
+def get_all_anomaly_indices():
+    anomaly_type_maps = {
+        "V": 1,
+    }
+
+    path = Path("./npz_files")
+    files = [p.name for p in path.iterdir() if p.is_file()]
+    files = sorted(files)
+    for file_full in files:
+        name = file_full.split(".")[0]
+
+        print('-'*100)
+        print(name)
+
+
+        raw_data = np.load(f"./npz_files/{name}.npz")
+        raw_signal = raw_data["signal"]
+        anomaly_label = raw_data["anomaly_label"]
+
+        for k, v in anomaly_type_maps.items():
+            np.unique(anomaly_label)
+            segments = get_anomaly_segments(anomaly_label, anomaly_type=v)
+
+            segments_info_list = []
+            for segment in segments:
+                segments_info_list.append(
+                    {
+                        "start": int(segment[0]),
+                        "end": int(segment[1]),
+                    }
+                )
+
+
+            if len(segments_info_list) > 0:
+                rng = random.Random(42)  # 固定 seed，保证可复现
+                rng.shuffle(segments_info_list)
+                # segments_info_list_train = segments_info_list[:int(len(segments_info_list) * 0.8)]
+                # segments_info_list_test = segments_info_list[int(len(segments_info_list) * 0.2):]
+
+
+                os.makedirs(f"./anomaly_indices/{name}", exist_ok=True)
+                with open(f"./anomaly_indices/{name}/{k}_segments.jsonl", "w") as f:
+                    for i, item in enumerate(segments_info_list):
+                        f.write(json.dumps(item) + "\n")
+
+                # os.makedirs(f"./anomaly_indices/{name}", exist_ok=True)
+                # with open(f"./anomaly_indices/{name}/{k}_segments_train.jsonl", "w") as f:
+                #     for i, item in enumerate(segments_info_list_train):
+                #         f.write(json.dumps(item) + "\n")
+
+                # with open(f"./anomaly_indices/{name}/{k}_segments_test.jsonl", "w") as f:
+                #     for i, item in enumerate(segments_info_list_test):
+                #         f.write(json.dumps(item) + "\n")
+
+
+                lengths = []
+
+                for i, (s, e) in enumerate(segments):
+                    # print(f"Segment {i}: start = {s}, end = {e}, length = {e - s + 1}")
+                    lengths.append(e - s + 1)
+
+                if len(lengths) > 0:
+                    print(f"总共有 {len(segments)} 段 {k}-type anomaly")
+                    print(max(lengths))
+                    print(min(lengths))
+                    print('-'*100)
+
+
+def has_exactly_one_anomaly_segment(label):
+    """
+    label: 1D array-like of 0/1
+    """
+    label = np.asarray(label).astype(int)
+
+    # 找到从 0 -> 1 的位置
+    starts = np.where((label[:-1] == 0) & (label[1:] == 1))[0]
+
+    # 如果第一个点就是 1，也算一个 segment
+    if label[0] == 1:
+        num_segments = len(starts) + 1
+    else:
+        num_segments = len(starts)
+
+    return num_segments == 1
+
+
+def extract_windows_containing_segments(
+    signal,
+    labels,
+    segments,
+    window_size,
+    length_range=(0.01, 0.50),
+    step=1,  # 滑窗步长，可以调大速度更快
+    jsonl_path=None,
+    anomaly_type=1
+):
+    """
+    从信号中截取长度为 window_size 的窗口，
+    条件：
+        1) 窗口要完全包含某一个 anomaly segment (start,end)
+        2) 窗口内 anomaly ratio 在 ratio_range 内
+    返回：
+        windows: [num_windows, window_size]
+        windows_label: [num_windows, window_size]
+        window_starts: 每个窗口的起点 index
+    """
+    jsonl_file = open(jsonl_path, "w") if jsonl_path is not None else None
+
+    min_length, max_length = length_range
+    min_ratio = min_length / window_size
+    max_ratio = max_length / window_size
+
+    T = len(signal)
+
+    windows = []
+    windows_label = []
+    window_starts = []
+
+
+    for one_seg in segments:
+        seg_start = one_seg["start"]
+        seg_end = one_seg["end"]
+        earliest = seg_end - window_size + 1
+        latest = seg_start
+
+        valid_range_start = max(0, earliest)
+        valid_range_end = min(latest, T - window_size)
+
+        if valid_range_start > valid_range_end:
+            # 异常段比窗口还长，无解
+            continue
+
+        min_seg_len = float("inf")
+        max_seg_len = 0
+        # 遍历所有可能起点
+        for start in range(valid_range_start, valid_range_end + 1, step):
+            end = start + window_size
+
+            label_win = labels[start:end]
+
+            if not np.array_equal(np.unique(label_win), np.array([0, anomaly_type])):
+                continue
+
+            if not has_exactly_one_anomaly_segment(label_win):
+                continue
+
+            anomaly_ratio = label_win.sum() / window_size
+
+            if min_ratio <= anomaly_ratio <= max_ratio:
+                windows.append(signal[start:end])
+                windows_label.append(label_win)
+                window_starts.append(start)
+
+                # ====== 在窗口内部重新统计“连续 1 段”的长度 ======
+                idx = np.where(label_win == anomaly_type)[0]
+                if len(idx) > 0:
+                    # 找出所有连续段
+                    seg_start_idx = idx[0]
+                    prev = idx[0]
+                    for i in idx[1:]:
+                        if i == prev + 1:
+                            prev = i
+                        else:
+                            # 前一段结束
+                            seg_len = prev - seg_start_idx + 1
+                            min_seg_len = min(min_seg_len, seg_len)
+                            max_seg_len = max(max_seg_len, seg_len)
+                            # 新的一段开始
+                            seg_start_idx = i
+                            prev = i
+                    # 别忘了最后一段
+                    seg_len = prev - seg_start_idx + 1
+                    min_seg_len = min(min_seg_len, seg_len)
+                    max_seg_len = max(max_seg_len, seg_len)
+
+                # plt.plot(signal[start:end,0], label="signal channel 0")
+                # plt.plot(label_win, label="anomaly label")
+                # plt.show()
+
+                record = {
+                    "ts_start": int(start),
+                    "ts_end": int(end),
+                    "anomaly_start": int(seg_start),
+                    "anomaly_end": int(seg_end),
+                    "anomaly_type": 1,
+                }
+                jsonl_file.write(json.dumps(record) + "\n")
+
+    # if min_seg_len == float("inf"):
+    #     min_seg_len = None
+    #     max_seg_len = None
+    #
+    # return (
+    #     np.array(windows),
+    #     np.array(windows_label),
+    #     np.array(window_starts),
+    #     min_seg_len,
+    #     max_seg_len
+    # )
+
+
+
+def get_time_series_with_anomaly_segments():
+    for filename in os.listdir("./npz_files"):
+        if filename.endswith(".npz"):
+            name = filename.split(".")[0]
+            raw_data = np.load(f"./npz_files/{name}.npz")
+            raw_signal = raw_data["signal"]
+            anomaly_label = raw_data["anomaly_label"]
+            print(raw_signal.shape)
+            segments = []
+            with open(f"./anomaly_indices/{name}/V_segments.jsonl", "r") as f:
+                for line in f:
+                    loaded_line = json.loads(line)
+                    segments.append(loaded_line)
+
+            os.makedirs(f'./ts_with_anomaly_indices/{name}', exist_ok=True)
+            extract_windows_containing_segments(
+                raw_signal,
+                anomaly_label,
+                segments,
+                window_size=384,
+                length_range=(140, 145),
+                step=1,
+                jsonl_path=f'./ts_with_anomaly_indices/{name}/V.jsonl',
+                anomaly_type=1
+            )
+
+
+if __name__ == "__main__":
+    # get_all_anomaly_indices()
+    # get_time_series_with_anomaly_segments()
+    get_normal_indices()
